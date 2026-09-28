@@ -44,13 +44,11 @@ const (
 
 var (
 	chromeURL = cmp.Or(os.Getenv("CHROME_DEBUG_URL"), "http://127.0.0.1:9222")
-	lookupMu  sync.Mutex // одна вкладка за раз
-	termCache sync.Map   // термин -> [2]string{заголовок, текст}
+	lookupMu  sync.Mutex 
+	termCache sync.Map   
 	blanks    = regexp.MustCompile(`(\n[ \t]*){3,}`)
 )
 
-// waitFor ждёт истинности JS-выражения. Ошибки вроде «target navigated» (страница
-// перезагрузилась посреди проверки Qrator) считаются временными.
 func waitFor(ctx context.Context, expr string, d time.Duration) bool {
 	for end := time.Now().Add(d); time.Now().Before(end) && ctx.Err() == nil; time.Sleep(300 * time.Millisecond) {
 		var ok bool
@@ -61,8 +59,6 @@ func waitFor(ctx context.Context, expr string, d time.Duration) bool {
 	return false
 }
 
-// getJSON открывает u во вкладке Chrome. Если Qrator не пускает (403), сначала заходит
-// на главную, чтобы браузер прошёл проверку, и повторяет.
 func getJSON(u string) (string, error) {
 	lookupMu.Lock()
 	defer lookupMu.Unlock()
@@ -100,7 +96,6 @@ type ruwikiResp struct {
 	} `json:"query"`
 }
 
-// searchTerm возвращает заголовок найденной статьи и её вводный абзац без разметки.
 func searchTerm(term string) (title, text string, err error) {
 	key := strings.ToLower(strings.TrimSpace(term))
 	if key == "" {
