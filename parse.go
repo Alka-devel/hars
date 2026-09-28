@@ -20,8 +20,12 @@ const (
 	wikiAPI  = wikiHome + "w/api.php"
 )
 
+func main() {
+	searchTerm("Программ")
+}
+
 var (
-	chromeURL = cmp.Or(os.Getenv("CHROME_DEBUG_URL"), "http://127.0.0.1:9222")
+	chromeURL = cmp.Or(os.Getenv("CHROME_DEBUG_URL"), "http://127.0.0.1:9223")
 	lookupMu  sync.Mutex 
 	termCache sync.Map   
 	blanks    = regexp.MustCompile(`(\n[ \t]*){3,}`)
