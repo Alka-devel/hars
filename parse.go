@@ -23,6 +23,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -37,209 +38,93 @@ import (
 )
 
 const (
-	ruwikiHome = "https://ru.ruwiki.ru/"
-	ruwikiAPI  = "https://ru.ruwiki.ru/w/api.php"
-
-	maxTabs    = 2                // не больше стольких вкладок одновременно
-	navTimeout = 90 * time.Second // общий лимит на один запрос (вместе с заходом на главную)
-	apiPoll    = 15 * time.Second // сколько ждать ответ api.php
-	homePoll   = 30 * time.Second // сколько ждать прохождения проверки Qrator на главной
-	cacheTTL   = 24 * time.Hour
-
-	// условия для chromedp.Poll (JS-выражения)
-	jsonReady  = `document.body && document.body.innerText.trim().startsWith('{')`
-	failedPage = `/^HTTP [45][0-9][0-9]/.test(document.title)`
-	homeReady  = `/Рувики/i.test(document.title)`
+	wikiHome = "https://ru.ruwiki.ru/"
+	wikiAPI  = wikiHome + "w/api.php"
 )
 
 var (
-	chromeURL = envOr("CHROME_DEBUG_URL", "http://127.0.0.1:9222")
-	tabSem    = make(chan struct{}, maxTabs)
-
-	cacheMu sync.Mutex
-	cache   = map[string]cachedTerm{}
+	chromeURL = cmp.Or(os.Getenv("CHROME_DEBUG_URL"), "http://127.0.0.1:9222")
+	lookupMu  sync.Mutex // одна вкладка за раз
+	termCache sync.Map   // термин -> [2]string{заголовок, текст}
+	blanks    = regexp.MustCompile(`(\n[ \t]*){3,}`)
 )
 
-type cachedTerm struct {
-	title   string
-	extract string
-	at      time.Time
+// waitFor ждёт истинности JS-выражения. Ошибки вроде «target navigated» (страница
+// перезагрузилась посреди проверки Qrator) считаются временными.
+func waitFor(ctx context.Context, expr string, d time.Duration) bool {
+	for end := time.Now().Add(d); time.Now().Before(end) && ctx.Err() == nil; time.Sleep(300 * time.Millisecond) {
+		var ok bool
+		if chromedp.Run(ctx, chromedp.Evaluate("!!("+expr+")", &ok)) == nil && ok {
+			return true
+		}
+	}
+	return false
 }
 
-type ruwikiPage struct {
-	PageID  int    `json:"pageid"`
-	Title   string `json:"title"`
-	Extract string `json:"extract"`
+// getJSON открывает u во вкладке Chrome. Если Qrator не пускает (403), сначала заходит
+// на главную, чтобы браузер прошёл проверку, и повторяет.
+func getJSON(u string) (string, error) {
+	lookupMu.Lock()
+	defer lookupMu.Unlock()
+	alloc, stop := chromedp.NewRemoteAllocator(context.Background(), chromeURL)
+	defer stop()
+	tab, closeTab := chromedp.NewContext(alloc)
+	defer closeTab()
+	ctx, cancel := context.WithTimeout(tab, 90*time.Second)
+	defer cancel()
+
+	var text string
+	load := func() bool {
+		return chromedp.Run(ctx, chromedp.Navigate(u)) == nil &&
+			waitFor(ctx, `document.body.innerText.trim()[0]=='{' || /^HTTP [45]/.test(document.title)`, 15*time.Second) &&
+			chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerText`, &text)) == nil &&
+			strings.HasPrefix(strings.TrimSpace(text), "{")
+	}
+	if load() {
+		return text, nil
+	}
+	if chromedp.Run(ctx, chromedp.Navigate(wikiHome)) == nil &&
+		waitFor(ctx, `/Рувики/i.test(document.title)`, 30*time.Second) && load() {
+		return text, nil
+	}
+	var title string
+	tctx, c2 := context.WithTimeout(tab, 5*time.Second)
+	defer c2()
+	chromedp.Run(tctx, chromedp.Title(&title))
+	return "", fmt.Errorf("рувики недоступна (заголовок страницы: %q)", title)
 }
 
-type ruwikiResponse struct {
+type ruwikiResp struct {
 	Query struct {
-		Pages map[string]ruwikiPage `json:"pages"`
+		Pages map[string]struct{ Title, Extract string } `json:"pages"`
 	} `json:"query"`
 }
 
-var blankLines = regexp.MustCompile(`(\n[ \t]*){3,}`)
-
-// tidyExtract схлопывает длинные серии пустых строк, которые оставляет MediaWiki.
-func tidyExtract(s string) string {
-	return strings.TrimSpace(blankLines.ReplaceAllString(s, "\n\n"))
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-// waitFor ждёт, пока JS-выражение expr станет истинным.
-// Ошибки вроде «Inspected target navigated or closed» (страница перезагрузилась
-// посреди проверки Qrator) считаются временными: просто пробуем ещё раз.
-func waitFor(ctx context.Context, expr string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		var ok bool
-		if err := chromedp.Run(ctx, chromedp.Evaluate("!!("+expr+")", &ok)); err == nil && ok {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("не дождались условия %q за %s", expr, timeout)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(300 * time.Millisecond):
-		}
-	}
-}
-
-// loadJSON открывает rawURL и ждёт либо JSON, либо страницу с ошибкой (HTTP 4xx/5xx).
-// ok=true, если в ответе JSON.
-func loadJSON(ctx context.Context, rawURL string) (string, bool, error) {
-	if err := chromedp.Run(ctx, chromedp.Navigate(rawURL)); err != nil {
-		return "", false, err
-	}
-	if err := waitFor(ctx, "("+jsonReady+") || ("+failedPage+")", apiPoll); err != nil {
-		return "", false, err
-	}
-	var text string
-	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body.innerText`, &text)); err != nil {
-		return "", false, err
-	}
-	return text, strings.HasPrefix(strings.TrimSpace(text), "{"), nil
-}
-
-// browserGet получает JSON по rawURL через вкладку запущенного Chrome.
-func browserGet(rawURL string) ([]byte, error) {
-	tabSem <- struct{}{}
-	defer func() { <-tabSem }()
-
-	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(context.Background(), chromeURL)
-	defer cancelAlloc()
-
-	// новая вкладка в браузере; закроется при cancelTab
-	tabCtx, cancelTab := chromedp.NewContext(allocCtx)
-	defer cancelTab()
-
-	runCtx, cancelRun := context.WithTimeout(tabCtx, navTimeout)
-	defer cancelRun()
-
-	// fail добавляет к ошибке заголовок страницы (например, «HTTP 403») для диагностики
-	fail := func(step string, err error) ([]byte, error) {
-		var pageTitle string
-		dctx, dcancel := context.WithTimeout(tabCtx, 5*time.Second)
-		defer dcancel()
-		_ = chromedp.Run(dctx, chromedp.Title(&pageTitle))
-		return nil, fmt.Errorf("browserGet (%s): %w (заголовок страницы: %q)", step, err, pageTitle)
-	}
-
-	// 1. сессия Qrator уже есть в профиле браузера — API ответит сразу
-	text, ok, err := loadJSON(runCtx, rawURL)
-	if err != nil {
-		return fail("запрос api", err)
-	}
-	if ok {
-		return []byte(text), nil
-	}
-
-	// 2. сессии нет или она протухла: заходим на главную, браузер проходит проверку Qrator
-	if err = chromedp.Run(runCtx, chromedp.Navigate(ruwikiHome)); err != nil {
-		return fail("открытие главной", err)
-	}
-	if err = waitFor(runCtx, homeReady, homePoll); err != nil {
-		return fail("проход проверки на главной", err)
-	}
-
-	// 3. повторяем запрос к API
-	text, ok, err = loadJSON(runCtx, rawURL)
-	if err != nil {
-		return fail("повторный запрос api", err)
-	}
-	if !ok {
-		return fail("повторный запрос api", fmt.Errorf("ответ не JSON"))
-	}
-	return []byte(text), nil
-}
-
-// searchTerm ищет термин одним запросом (generator=search + extracts) и возвращает
-// заголовок найденной статьи и вводный абзац без вики-разметки.
-func searchTerm(term string) (title, extract string, err error) {
-	term = strings.TrimSpace(term)
-	if term == "" {
+// searchTerm возвращает заголовок найденной статьи и её вводный абзац без разметки.
+func searchTerm(term string) (title, text string, err error) {
+	key := strings.ToLower(strings.TrimSpace(term))
+	if key == "" {
 		return "", "", fmt.Errorf("пустой запрос")
 	}
-	key := strings.ToLower(term)
-
-	cacheMu.Lock()
-	if c, ok := cache[key]; ok && time.Since(c.at) < cacheTTL {
-		cacheMu.Unlock()
-		return c.title, c.extract, nil
+	if v, ok := termCache.Load(key); ok {
+		r := v.([2]string)
+		return r[0], r[1], nil
 	}
-	cacheMu.Unlock()
-
-	q := url.Values{}
-	q.Set("action", "query")
-	q.Set("generator", "search")
-	q.Set("gsrsearch", term)
-	q.Set("gsrlimit", "1")
-	q.Set("prop", "extracts")
-	q.Set("exintro", "1")
-	q.Set("explaintext", "1")
-	q.Set("format", "json")
-
-	body, err := browserGet(ruwikiAPI + "?" + q.Encode())
+	q := url.Values{"action": {"query"}, "generator": {"search"}, "gsrsearch": {key}, "gsrlimit": {"1"},
+		"prop": {"extracts"}, "exintro": {"1"}, "explaintext": {"1"}, "format": {"json"}}
+	body, err := getJSON(wikiAPI + "?" + q.Encode())
 	if err != nil {
-		return "", "", err
+		return
 	}
-
-	var result ruwikiResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", "", fmt.Errorf("разбор ответа рувики: %w", err)
+	var r ruwikiResp
+	if err = json.Unmarshal([]byte(body), &r); err != nil {
+		return
 	}
-	for _, p := range result.Query.Pages {
-		e := tidyExtract(p.Extract)
-		if e == "" {
-			continue
+	for _, p := range r.Query.Pages {
+		if t := strings.TrimSpace(blanks.ReplaceAllString(p.Extract, "\n\n")); t != "" {
+			termCache.Store(key, [2]string{p.Title, t})
+			return p.Title, t, nil
 		}
-		cacheMu.Lock()
-		cache[key] = cachedTerm{title: p.Title, extract: e, at: time.Now()}
-		cacheMu.Unlock()
-		return p.Title, e, nil
 	}
 	return "", "", fmt.Errorf("ничего не найдено по запросу %q", term)
-}
-
-func main() {
-	term := "капитуляция"
-	if len(os.Args) > 1 {
-		term = strings.Join(os.Args[1:], " ")
-	}
-	title, extract, err := searchTerm(term)
-	if err != nil {
-		fmt.Println("ОШИБКА:", err)
-		os.Exit(1)
-	}
-	fmt.Println(title)
-	fmt.Println()
-	fmt.Println(extract)
 }
