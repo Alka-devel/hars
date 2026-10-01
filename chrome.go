@@ -131,7 +131,11 @@ func StartChrome() (*Browser, error) {
 			"--user-agent=" + chromeUA,
 			"--no-first-run",
 			"--no-default-browser-check",
+			"--disable-dev-shm-usage", // маленький /dev/shm на слабых серверах
 			"about:blank",
+		}
+		if os.Geteuid() == 0 { // на Windows возвращает -1, не мешает
+			args = append([]string{"--no-sandbox"}, args...)
 		}
 		// CHROME_HEADLESS=0 — запустить с обычным окном, для разработки на машине с
 		// графикой это проще и надёжнее (headless даёт о себе знать не только через UA).
