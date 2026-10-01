@@ -19,6 +19,23 @@ var chromeCandidates = []string{
 	"brave-browser",
 }
 
+func chromeWellKnownPaths() []string {
+	pf := os.Getenv("ProgramFiles")
+	pf86 := os.Getenv("ProgramFiles(x86)")
+	lad := os.Getenv("LocalAppData")
+	return []string{
+		filepath.Join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+		filepath.Join(pf86, "Google", "Chrome", "Application", "chrome.exe"),
+		filepath.Join(lad, "Google", "Chrome", "Application", "chrome.exe"),
+		filepath.Join(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+		filepath.Join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+		filepath.Join(lad, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/Applications/Chromium.app/Contents/MacOS/Chromium",
+		"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+	}
+}
+
 func findChromeBinary() (string, error) {
 	if bin := os.Getenv("CHROME_BIN"); bin != "" {
 		if path, err := exec.LookPath(bin); err == nil {
@@ -28,6 +45,11 @@ func findChromeBinary() (string, error) {
 	}
 	for _, name := range chromeCandidates {
 		if path, err := exec.LookPath(name); err == nil {
+			return path, nil
+		}
+	}
+	for _, path := range chromeWellKnownPaths() {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
 			return path, nil
 		}
 	}
@@ -96,7 +118,7 @@ func StartChrome() (*Browser, error) {
 			return
 		}
 		ready <- waitChromePort(chromeStartTimeout)
-		cmd.Wait()
+		cmd.Wait() // держим и горутину, и ОС-поток живыми, пока жив Chrome
 	}()
 
 	if err := <-ready; err != nil {
@@ -107,6 +129,7 @@ func StartChrome() (*Browser, error) {
 	return &Browser{cancel: cancel, done: done}, nil
 }
 
+// Close останавливает Chrome и ждёт завершения процесса.
 func (b *Browser) Close() {
 	b.cancel()
 	<-b.done
