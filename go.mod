@@ -1,6 +1,6 @@
-module par
+module github.com/Alka-devel/ruwiki-term
 
-go 1.27.0
+go 1.26
 
 require github.com/chromedp/chromedp v0.16.0
 

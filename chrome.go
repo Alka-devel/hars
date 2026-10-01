@@ -1,16 +1,4 @@
-package main
-
-// Управление Chrome для поиска терминов на Рувики: процесс запускается и останавливается
-// самой программой, отдельно руками его поднимать не нужно.
-//
-// Chrome запускается ОБЫЧНЫМ os/exec, а не через chromedp.NewExecAllocator — тот добавляет
-// флаг --enable-automation (из-за него navigator.webdriver = true и защита сайта режет
-// запрос). chromedp здесь только подключается снаружи к уже работающему браузеру
-// (chromedp.NewRemoteAllocator, см. terms.go).
-//
-// Если процесс бота упадёт, будет убит (kill -9) или уйдёт в OOM, ядро Linux само пришлёт
-// Chrome SIGKILL (см. setPdeathsig в chrome_linux.go) — зависших процессов не останется.
-// При обычном завершении Chrome останавливает Close().
+package ruwiki
 
 import (
 	"context"
@@ -24,9 +12,6 @@ import (
 	"time"
 )
 
-// chromeCandidates — известные имена бинарников на движке Chromium (CDP, который нужен
-// chromedp, поддерживают только они). Firefox сюда не входит принципиально: у него другой
-// протокол удалённого управления, chromedp с ним не работает.
 var chromeCandidates = []string{
 	"google-chrome-stable", "google-chrome",
 	"chromium", "chromium-browser",
@@ -34,8 +19,6 @@ var chromeCandidates = []string{
 	"brave-browser",
 }
 
-// findChromeBinary возвращает путь к браузеру на Chromium: сначала смотрит переменную
-// окружения CHROME_BIN (если задана руками), иначе перебирает chromeCandidates в PATH.
 func findChromeBinary() (string, error) {
 	if bin := os.Getenv("CHROME_BIN"); bin != "" {
 		if path, err := exec.LookPath(bin); err == nil {
@@ -72,12 +55,12 @@ func chromeProfileDir() (string, error) {
 	return dir, nil
 }
 
-type chromeProc struct {
+type Browser struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-func startChrome() (*chromeProc, error) {
+func StartChrome() (*Browser, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	ready := make(chan error, 1)
@@ -113,7 +96,7 @@ func startChrome() (*chromeProc, error) {
 			return
 		}
 		ready <- waitChromePort(chromeStartTimeout)
-		cmd.Wait() // держим и горутину, и ОС-поток живыми, пока жив Chrome
+		cmd.Wait()
 	}()
 
 	if err := <-ready; err != nil {
@@ -121,13 +104,12 @@ func startChrome() (*chromeProc, error) {
 		<-done
 		return nil, err
 	}
-	return &chromeProc{cancel: cancel, done: done}, nil
+	return &Browser{cancel: cancel, done: done}, nil
 }
 
-// Close останавливает Chrome и ждёт завершения процесса.
-func (c *chromeProc) Close() {
-	c.cancel()
-	<-c.done
+func (b *Browser) Close() {
+	b.cancel()
+	<-b.done
 }
 
 func waitChromePort(timeout time.Duration) error {

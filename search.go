@@ -1,4 +1,4 @@
-package main
+package ruwiki
 
 import (
 	"context"
@@ -66,7 +66,8 @@ type ruwikiResp struct {
 	} `json:"query"`
 }
 
-func searchTerm(term string) (title, text string, err error) {
+// SearchTerm search term on RUWIKI
+func SearchTerm(term string) (title, text string, err error) {
 	term = strings.TrimSpace(term)
 	if term == "" {
 		return "", "", fmt.Errorf("пустой запрос")
