@@ -94,6 +94,7 @@ func StartChrome() (*Browser, error) {
 
 		bin, err := findChromeBinary()
 		if err != nil {
+			fmt.Println("u kow")
 			ready <- err
 			return
 		}
@@ -102,15 +103,21 @@ func StartChrome() (*Browser, error) {
 			ready <- err
 			return
 		}
-		cmd := exec.CommandContext(ctx, bin,
-			"--headless=new",
-			"--remote-debugging-port="+chromePort,
-			"--user-data-dir="+profileDir,
-			"--user-agent="+chromeUA,
+		args := []string{
+			"--remote-debugging-port=" + chromePort,
+			"--user-data-dir=" + profileDir,
+			"--user-agent=" + chromeUA,
 			"--no-first-run",
 			"--no-default-browser-check",
 			"about:blank",
-		)
+		}
+		// CHROME_HEADLESS=0 — запустить с обычным окном, для разработки на машине с
+		// графикой это проще и надёжнее (headless даёт о себе знать не только через UA).
+		// На Linux-сервере без графики headless остаётся по умолчанию.
+		if os.Getenv("CHROME_HEADLESS") != "0" {
+			args = append([]string{"--headless=new"}, args...)
+		}
+		cmd := exec.CommandContext(ctx, bin, args...)
 		setPdeathsig(cmd)
 
 		if err := cmd.Start(); err != nil {
