@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	cu "github.com/Davincible/chromedp-undetected"
 	"github.com/chromedp/chromedp"
 )
 
@@ -40,15 +39,13 @@ func waitFor(ctx context.Context, expr string, d time.Duration) bool {
 // а не NewExecAllocator — второй запускал бы свой браузер на каждый вызов). Если Qrator
 // не пускает сразу, заходит на главную, чтобы пройти проверку, и повторяет запрос.
 func getJSON(u string) (string, error) {
-	cfg := cu.NewConfig(cu.WithTimeout(90 * time.Second))
-	// cfg.ChromeFlags = append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", "new"))
-	ctx, cancel, err := cu.New(cfg)
-	if err != nil {
-		return "", fmt.Errorf("не удалось запустить undetected-браузер: %w", err)
-	}
-	defer func() {
-		cancel()
-	}()
+	alloc, stop := chromedp.NewRemoteAllocator(context.Background(), chromeDebugURL)
+	defer stop()
+	tab, closeTab := chromedp.NewContext(alloc)
+	defer closeTab()
+	ctx, cancel := context.WithTimeout(tab, 90*time.Second)
+	defer cancel()
+
 	var text string
 	load := func() bool {
 		return chromedp.Run(ctx, chromedp.Navigate(u)) == nil &&
@@ -64,7 +61,7 @@ func getJSON(u string) (string, error) {
 		return text, nil
 	}
 	var title string
-	tctx, c2 := context.WithTimeout(context.Background(), 5*time.Second)
+	tctx, c2 := context.WithTimeout(tab, 5*time.Second)
 	defer c2()
 	chromedp.Run(tctx, chromedp.Title(&title))
 	return "", fmt.Errorf("рувики недоступна (заголовок страницы: %q)", title)
@@ -90,6 +87,8 @@ func SearchTerm(term string) (title, text string, err error) {
 		"gsrnamespace": {"0"}, "redirects": {"1"},
 		"prop": {"extracts"}, "exintro": {"1"}, "exsentences": {"3"}, "explaintext": {"1"}, "format": {"json"},
 	}
+	// exsentences режет по числу предложений независимо от разделов — exintro сам по себе
+	// не гарантия короткого ответа: у некоторых статей вступление длинное либо не обрезается
 	body, err := getJSON(wikiAPI + "?" + q.Encode())
 	if err != nil {
 		return "", "", err
@@ -99,9 +98,16 @@ func SearchTerm(term string) (title, text string, err error) {
 		return "", "", fmt.Errorf("разбор ответа рувики: %w", err)
 	}
 	for _, p := range r.Query.Pages {
-		if t := strings.TrimSpace(blanks.ReplaceAllString(p.Extract, "\n\n")); t != "" {
-			return p.Title, t, nil
+		t := strings.TrimSpace(blanks.ReplaceAllString(p.Extract, "\n\n"))
+		if t == "" {
+			continue
 		}
+		// подстраховка на стороне кода: даже если сайт всё равно пришлёт больше одного
+		// абзаца, оставляем только первый
+		if i := strings.Index(t, "\n\n"); i != -1 {
+			t = t[:i]
+		}
+		return p.Title, t, nil
 	}
 	return "", "", fmt.Errorf("ничего не найдено по запросу %q", term)
 }
