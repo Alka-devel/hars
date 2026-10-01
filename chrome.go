@@ -1,5 +1,17 @@
 package ruwiki
 
+// Управление Chrome для поиска терминов на Рувики: процесс запускается и останавливается
+// самой программой, отдельно руками его поднимать не нужно.
+//
+// Chrome запускается ОБЫЧНЫМ os/exec, а не через chromedp.NewExecAllocator — тот добавляет
+// флаг --enable-automation (из-за него navigator.webdriver = true и защита сайта режет
+// запрос). chromedp здесь только подключается снаружи к уже работающему браузеру
+// (chromedp.NewRemoteAllocator, см. terms.go).
+//
+// Если процесс бота упадёт, будет убит (kill -9) или уйдёт в OOM, ядро Linux само пришлёт
+// Chrome SIGKILL (см. setPdeathsig в chrome_linux.go) — зависших процессов не останется.
+// При обычном завершении Chrome останавливает Close().
+
 import (
 	"context"
 	"errors"
@@ -12,6 +24,9 @@ import (
 	"time"
 )
 
+// chromeCandidates — известные имена бинарников на движке Chromium (CDP, который нужен
+// chromedp, поддерживают только они). Firefox сюда не входит принципиально: у него другой
+// протокол удалённого управления, chromedp с ним не работает.
 var chromeCandidates = []string{
 	"google-chrome-stable", "google-chrome",
 	"chromium", "chromium-browser",
@@ -19,6 +34,11 @@ var chromeCandidates = []string{
 	"brave-browser",
 }
 
+// findChromeBinary возвращает путь к браузеру на Chromium: сначала смотрит переменную
+// окружения CHROME_BIN (если задана руками), иначе перебирает chromeCandidates в PATH.
+// chromeWellKnownPaths — типичные пути установки Chrome/Edge/Brave на Windows и macOS.
+// На Linux переменные окружения вроде ProgramFiles просто пустые, os.Stat на таких путях
+// честно вернёт «не найдено», лишнего вреда нет.
 func chromeWellKnownPaths() []string {
 	pf := os.Getenv("ProgramFiles")
 	pf86 := os.Getenv("ProgramFiles(x86)")
@@ -48,6 +68,9 @@ func findChromeBinary() (string, error) {
 			return path, nil
 		}
 	}
+	// На Windows (и macOS) установщики Chrome обычно НЕ добавляют браузер в PATH,
+	// поэтому LookPath выше может не найти уже установленный браузер — проверяем
+	// типичные пути установки напрямую.
 	for _, path := range chromeWellKnownPaths() {
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
 			return path, nil
@@ -94,7 +117,6 @@ func StartChrome() (*Browser, error) {
 
 		bin, err := findChromeBinary()
 		if err != nil {
-			fmt.Println("u kow")
 			ready <- err
 			return
 		}
